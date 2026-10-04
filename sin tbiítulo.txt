@@ -1,0 +1,2756 @@
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local PathfindingService = game:GetService("PathfindingService")
+local TweenService = game:GetService("TweenService")
+local CoreGui = game:GetService("CoreGui")
+local Lighting = game:GetService("Lighting")
+local UserInputService = game:GetService("UserInputService")
+local VirtualUser = game:GetService("VirtualUser")
+
+local LocalPlayer = Players.LocalPlayer
+local Camera = Workspace.CurrentCamera
+
+local CFG = {
+    Debug = true,
+    Reach = 9,
+    Standoff = 4,
+    Meter = 3.55,
+    Cell = 2,
+    VStep = 2,
+    Plans = {2.6, 1.8, 1.2, 0.9},
+    MaxExpand = 9000,
+    MaxExpand3 = 16000,
+    HideSpeed = 400,
+    HideTp = true,
+    TpMax = 250,
+    TpChunk = 40,
+    BodyWidth = 1.6,
+    RushTrigger = 45,
+    AmbushTrigger = 45,
+    RushWait = 0.3,
+    RushExitDelay = 0.7,
+    AmbushExit = 50,
+    AmbushWait = 2.5,
+    ScreechLook = 3,
+    ExploreStep = 6,
+    SightRadius = 14,
+    LibraryRoom = 50,
+    HopFallback = true,
+    RemoveSeekArms = false,
+    ArmHover = 20,
+    LootTime = 120,
+    AutoPickRadius = 22,
+    HealBelow = 50,
+}
+
+local Settings = {Speed = 22, Tp = true, Loot = false, Esp = true, Fullbright = false, AutoPick = false, AutoHeal = true}
+local Stats = {rooms = 0, last = nil}
+
+_G.AutoFarmRunning = false
+
+local statusLabel
+local activeTween
+local threat = false
+local lastStatus = ""
+local memory = setmetatable({}, {__mode = "k"})
+local tried = setmetatable({}, {__mode = "k"})
+local triedC = setmetatable({}, {__mode = "k"})
+local moves = setmetatable({}, {__mode = "k"})
+local kfails = setmetatable({}, {__mode = "k"})
+local opened = setmetatable({}, {__mode = "k"})
+local tpAdapt = {direct = CFG.TpMax, chunk = CFG.TpChunk, ok = 0}
+
+local function log(...)
+    if CFG.Debug then print("[AF]", ...) end
+end
+
+local function setStatus(t)
+    if t == lastStatus then return end
+    lastStatus = t
+    if statusLabel then statusLabel.Text = t end
+    log(t)
+end
+
+local EntityNames = {"rush","ambush","seek","eyes","screech","halt","a-60","a-120","giggleceiling","monumententity","sallymoving","jeffthekiller","gloombatswarm","figurerig","sideroomdupe"}
+local ObjList = {"libraryhintpaper","livehintbook","libearybook","libearypaper","keyobtain","leverforgate","livebreakerpolepickup","electricalkeyobtain"}
+local ItemList = {"ak-47","alarmclock","aloe","an-94","anchors","a-90sstopsign","backdoorkey","backdoorlock","bandage","bandagepack","battery","batterypack","bigbomb","bluekeycard","blueprince","bomb","bread","breakerpole","bulklight","buddy","cactus","candle","carmelapple","cheese","chocolatebar","citamines","coltanaconda","cookie","crossbow","crucifix","dbshotgun","deserteagle","electricalkey","electricalroomfuse","energydrink","executionroomkey","flashlight","freezegun","flamethrower","g36c","generator","generatorfuse","giftlauncher","glitchfragment","gweensoda","guidancecandy","headlamp","healingpad","holyhandgrenade","hastelever","hookshot","hotelkey","hotellock","icetripmine","invincibilitystar","jackobomb","keycard","knockbomb","landmine","lantern","laserpointer","level5keycard","libearylock","light_bulb","lockpick","lolipop","mg42","m14","m16a2","m1911","m249","m5k","m4a1","moonlightcandle","moonlightfloat","moonlightsmoothie","monkey","nanner","nannerpeel","nestgenerator","nvcs-3000","orangekeycard","p90","paintingoval","paintingrectanglelyingshortsides","paintingrectanglelyinglongsides","paintingsquare","plantofvirdis","potion","r870","redenergydrink","rock","roto_door","rubberchicken","sacredherb","saltshaker","shakelight","shears","skeletonkey","smoothie","smallshieldpotion","speedboostpad","spraypaint","starlightbottle","starlightjug","starlightvial","straplight","strawberrycandy","strongherb","strongerherb","strongestherb","superherb","sweeherb","throwablehatstand","throwablenormalcardboardbox","throwableofficechair","throwablepottedplant","throwableregalchair","throwableregalottoman","throwablestool","throwabletrashcan","throwablewidecardboardbox","throwablewoodenchair","throwablewoodencrate","tipjar","vitamins"}
+
+local hasDrawing = Drawing ~= nil
+local activeESPs = {}
+
+local function SafePos(obj)
+    if not obj or not obj.Parent then return nil end
+    if obj:IsA("Attachment") then return obj.WorldPosition end
+    if obj:IsA("Model") then
+        local ok, pivot = pcall(function() return obj:GetPivot() end)
+        return ok and pivot.Position or nil
+    elseif obj:IsA("BasePart") then
+        return obj.Position
+    end
+end
+
+local function Cleanup(obj, data)
+    pcall(function()
+        if data.Highlight then data.Highlight:Destroy() end
+        if data.Text then data.Text:Remove() end
+    end)
+    activeESPs[obj] = nil
+end
+
+local function Has(list, name)
+    for _, n in ipairs(list) do
+        if name:find(n, 1, true) then return true end
+    end
+    return false
+end
+
+local function CreateESP(obj)
+    if activeESPs[obj] or not obj.Parent or not obj:IsA("Model") then return end
+
+    local cur = obj
+    while cur and cur ~= Workspace do
+        if activeESPs[cur] and cur ~= obj then return end
+        local p = cur.Name:lower()
+        if p:find("bookcase", 1, true) or p:find("modular_bookshelf", 1, true) or p:find("shelf", 1, true) then return end
+        cur = cur.Parent
+    end
+
+    local lowerN = obj.Name:lower()
+    local rooms = Workspace:FindFirstChild("CurrentRooms")
+
+    local isEntity = Has(EntityNames, lowerN)
+    local isObj = Has(ObjList, lowerN)
+    local isItem = Has(ItemList, lowerN)
+    local isDoor = rooms and lowerN == "door" and obj:IsDescendantOf(rooms)
+
+    if not (isEntity or isItem or isObj or isDoor) then return end
+
+    local label = lowerN:find("hintbook", 1, true) and "Book"
+        or lowerN:find("hintpaper", 1, true) and "Paper"
+        or lowerN:find("figurerig", 1, true) and "Figure"
+        or lowerN:find("keyobtain", 1, true) and "Key"
+        or lowerN:find("leverforgate", 1, true) and "Lever"
+        or lowerN == "door" and "Door"
+        or obj.Name
+
+    local fill = isEntity and Color3.fromRGB(255,0,0) or isItem and Color3.fromRGB(160,32,240) or Color3.fromRGB(255,255,255)
+
+    local hl = Instance.new("Highlight")
+    hl.Adornee = obj
+    hl.Parent = obj
+    hl.FillColor = fill
+    hl.OutlineColor = Color3.fromRGB(255,255,255)
+    hl.FillTransparency = isEntity and 0.4 or isItem and 0.6 or 0.3
+    hl.OutlineTransparency = 0.2
+
+    local txt
+    if hasDrawing then
+        txt = Drawing.new("Text")
+        txt.Size = 14
+        txt.Center = true
+        txt.Outline = true
+        txt.Color = fill
+        txt.Visible = false
+    end
+
+    activeESPs[obj] = {Highlight = hl, Text = txt, Label = label}
+end
+
+local function HookContainer(container)
+    for _, d in ipairs(container:GetDescendants()) do CreateESP(d) end
+    container.DescendantAdded:Connect(function(d)
+        task.defer(function() task.wait(0.05) CreateESP(d) end)
+    end)
+end
+
+local function HookRooms(rooms)
+    for _, room in ipairs(rooms:GetChildren()) do HookContainer(room) end
+    rooms.ChildAdded:Connect(function(room) HookContainer(room) end)
+end
+
+local roomsFolder = Workspace:FindFirstChild("CurrentRooms")
+if roomsFolder then HookRooms(roomsFolder) end
+
+local drops = Workspace:FindFirstChild("Drops")
+if drops then HookContainer(drops) end
+
+for _, c in ipairs(Workspace:GetChildren()) do CreateESP(c) end
+Workspace.ChildAdded:Connect(function(c)
+    task.defer(function()
+        task.wait(0.05)
+        CreateESP(c)
+        if c.Name == "CurrentRooms" then HookRooms(c) end
+        if c.Name == "Drops" then HookContainer(c) end
+    end)
+end)
+
+RunService.RenderStepped:Connect(function()
+    local char = LocalPlayer.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if not root then return end
+    for obj, data in pairs(activeESPs) do
+        if not obj.Parent then
+            Cleanup(obj, data)
+        else
+            pcall(function() data.Highlight.Enabled = Settings.Esp end)
+            if data.Text then
+                local pos = Settings.Esp and SafePos(obj)
+                if pos then
+                    local sp, onScreen = Camera:WorldToViewportPoint(pos)
+                    local dist = (root.Position - pos).Magnitude
+                    if onScreen and dist < 3000 then
+                        data.Text.Position = Vector2.new(sp.X, sp.Y - 20)
+                        data.Text.Text = string.format("%s [%dm]", data.Label, math.floor(dist / CFG.Meter))
+                        data.Text.Visible = true
+                    else
+                        data.Text.Visible = false
+                    end
+                else
+                    data.Text.Visible = false
+                end
+            end
+        end
+    end
+end)
+
+local function Running()
+    return _G.AutoFarmRunning
+end
+
+local function Active(o)
+    if o and o.force then return Running() end
+    return Running() and not threat
+end
+
+local function Root()
+    local c = LocalPlayer.Character
+    if not c then return nil, nil end
+    return c:FindFirstChild("HumanoidRootPart"), c:FindFirstChildOfClass("Humanoid")
+end
+
+local function GetRooms()
+    return Workspace:FindFirstChild("CurrentRooms")
+end
+
+local function GetIdx()
+    local v
+    pcall(function() v = ReplicatedStorage.GameData.LatestRoom.Value end)
+    return v or LocalPlayer:GetAttribute("CurrentRoom")
+end
+
+local function CurRoom()
+    local rooms, idx = GetRooms(), GetIdx()
+    return rooms and idx and rooms:FindFirstChild(tostring(idx))
+end
+
+local function PromptOf(obj)
+    return obj:FindFirstChildWhichIsA("ProximityPrompt", true)
+end
+
+local function Meters(obj)
+    local root = Root()
+    local pos = SafePos(obj)
+    if not root or not pos then return math.huge end
+    return (root.Position - pos).Magnitude / CFG.Meter
+end
+
+local function Mem(room)
+    room = room or Workspace
+    local m = memory[room]
+    if not m then
+        m = {visited = {}, bad = {}, fail = {}}
+        memory[room] = m
+    end
+    return m
+end
+
+local function KillArms(container)
+    local n = 0
+    for _, d in ipairs(container:GetDescendants()) do
+        if d.Name == "Seek_Arm" then
+            pcall(function() d:Destroy() end)
+            n = n + 1
+        end
+    end
+    return n
+end
+
+if CFG.RemoveSeekArms then
+    Workspace.DescendantAdded:Connect(function(d)
+        if d.Name == "Seek_Arm" then
+            task.defer(function() pcall(function() d:Destroy() end) end)
+        end
+    end)
+    task.spawn(function()
+        local lastFull = 0
+        while true do
+            task.wait(0.3)
+            local rooms = GetRooms()
+            local idx = tonumber(GetIdx())
+            if rooms then
+                for _, room in ipairs(rooms:GetChildren()) do
+                    local num = tonumber(room.Name)
+                    if not idx or not num or math.abs(num - idx) <= 2 then KillArms(room) end
+                end
+            end
+            if os.clock() - lastFull > 3 then
+                lastFull = os.clock()
+                KillArms(Workspace)
+            end
+        end
+    end)
+end
+
+local function MakeParams()
+    local list = {}
+    local rooms = GetRooms()
+    if rooms then list[1] = rooms end
+    local rp = RaycastParams.new()
+    rp.FilterType = Enum.RaycastFilterType.Include
+    rp.FilterDescendantsInstances = list
+    pcall(function() rp.RespectCanCollide = true end)
+    local op = OverlapParams.new()
+    op.FilterType = Enum.RaycastFilterType.Include
+    op.FilterDescendantsInstances = list
+    pcall(function() op.RespectCanCollide = true end)
+    return rp, op
+end
+
+local liftCache = {v = 3, t = 0}
+
+local function Lift()
+    local now = os.clock()
+    if now - liftCache.t < 0.5 then return liftCache.v end
+    local root, hum = Root()
+    if not root or not hum then return liftCache.v end
+    local v = hum.HipHeight + root.Size.Y / 2
+    if hum.FloorMaterial ~= Enum.Material.Air then
+        local rp = MakeParams()
+        local hit = Workspace:Raycast(root.Position, Vector3.new(0, -8, 0), rp)
+        if hit then
+            local m = root.Position.Y - hit.Position.Y
+            if m > 1.5 and m < 5 then v = m end
+        end
+    end
+    liftCache.v, liftCache.t = v, now
+    return v
+end
+
+local function TopY(p)
+    local cf, s = p.CFrame, p.Size
+    return cf.Position.Y + (math.abs(cf.RightVector.Y) * s.X + math.abs(cf.UpVector.Y) * s.Y + math.abs(cf.LookVector.Y) * s.Z) / 2
+end
+
+local function Blocks(p, floorY)
+    if not p.CanCollide then return false end
+    local s = p.Size
+    if math.max(s.X, s.Y, s.Z) < 1.5 then return false end
+    if TopY(p) - floorY < 1.6 then return false end
+    for d in pairs(opened) do
+        if p:IsDescendantOf(d) then return false end
+    end
+    return true
+end
+
+local function ObbHit(p, c, h)
+    local cf, s = p.CFrame, p.Size / 2
+    local d = cf.Position - c
+    local ax = {cf.RightVector, cf.UpVector, cf.LookVector}
+    local ah = {s.X, s.Y, s.Z}
+    local bx = {Vector3.xAxis, Vector3.yAxis, Vector3.zAxis}
+    local bh = {h.X, h.Y, h.Z}
+    local function sep(L)
+        if L.Magnitude < 0.0001 then return false end
+        L = L.Unit
+        local ra, rb = 0, 0
+        for i = 1, 3 do
+            ra = ra + ah[i] * math.abs(ax[i]:Dot(L))
+            rb = rb + bh[i] * math.abs(bx[i]:Dot(L))
+        end
+        return math.abs(d:Dot(L)) > ra + rb
+    end
+    for i = 1, 3 do
+        if sep(ax[i]) or sep(bx[i]) then return false end
+        for j = 1, 3 do
+            if sep(ax[i]:Cross(bx[j])) then return false end
+        end
+    end
+    return true
+end
+
+local function FloorAt(x, z, baseY, rp)
+    local origin = Vector3.new(x, baseY + 2.2, z)
+    local low
+    for _ = 1, 6 do
+        local len = origin.Y - (baseY - 2.8)
+        if len <= 0.1 then break end
+        local hit = Workspace:Raycast(origin, Vector3.new(0, -len, 0), rp)
+        if not hit then break end
+        local y = hit.Position.Y
+        if y <= baseY + 0.35 then return y end
+        if y > baseY + 1.6 then return nil end
+        low = low or y
+        origin = Vector3.new(x, y - 0.05, z)
+    end
+    return low
+end
+
+local function BodyFree(x, y, z, w, op)
+    local h = 3.4
+    local c = Vector3.new(x, y + 1.6 + h / 2, z)
+    local parts = Workspace:GetPartBoundsInBox(CFrame.new(c), Vector3.new(w, h, w), op)
+    local half = Vector3.new(w / 2, h / 2, w / 2)
+    for i = 1, #parts do
+        if Blocks(parts[i], y) and ObbHit(parts[i], c, half) then return false end
+    end
+    return true
+end
+
+local function Solid3(p)
+    if not p.CanCollide then return false end
+    local s = p.Size
+    if math.max(s.X, s.Y, s.Z) < 0.8 then return false end
+    for d in pairs(opened) do
+        if p:IsDescendantOf(d) then return false end
+    end
+    return true
+end
+
+local function BodyFree3(x, feetY, z, w, op)
+    local c = Vector3.new(x, feetY + 3.1, z)
+    local parts = Workspace:GetPartBoundsInBox(CFrame.new(c), Vector3.new(w, 3.8, w), op)
+    local half = Vector3.new(w / 2, 1.9, w / 2)
+    for i = 1, #parts do
+        if Solid3(parts[i]) and ObbHit(parts[i], c, half) then return false end
+    end
+    return true
+end
+
+local function SegFree3(a, b, w, op, lift)
+    local d = b - a
+    local n = math.max(1, math.ceil(d.Magnitude / 1.5))
+    for i = 1, n do
+        local p = a + d * (i / n)
+        if not BodyFree3(p.X, p.Y - lift, p.Z, w, op) then return false end
+    end
+    return true
+end
+
+local function RayScan(origin, vec, floorY, rp, collect)
+    local total = vec.Magnitude
+    if total < 0.01 then return false end
+    local dir = vec.Unit
+    local travelled = 0
+    for _ = 1, 12 do
+        local hit = Workspace:Raycast(origin, dir * (total - travelled), rp)
+        if not hit then return false end
+        if Blocks(hit.Instance, floorY) then
+            if not collect then return true end
+            collect(hit.Instance)
+        end
+        travelled = travelled + (hit.Position - origin).Magnitude + 0.05
+        if travelled >= total then return false end
+        origin = hit.Position + dir * 0.05
+    end
+    return false
+end
+
+local function PathClear(from, to, rp, half)
+    local d = to - from
+    if d.Magnitude < 0.1 then return true end
+    rp = rp or MakeParams()
+    half = half or 1.1
+    local floorY = from.Y - Lift()
+    local side = d.Unit:Cross(Vector3.yAxis)
+    side = side.Magnitude < 0.01 and Vector3.xAxis or side.Unit
+    for _, h in ipairs({2.3, 3.6, 5}) do
+        for _, s in ipairs({-half, 0, half}) do
+            local o = Vector3.new(from.X, floorY + h, from.Z) + side * s
+            if RayScan(o, d, floorY, rp, nil) then return false end
+        end
+    end
+    return true
+end
+
+local hasBlockcast = pcall(function() return Workspace.Blockcast end)
+
+local function Irrelevant(p, loose)
+    if not p.CanCollide then return true end
+    if p.Name == "Seek_Arm" then return true end
+    local s = p.Size
+    if math.max(s.X, s.Y, s.Z) < (loose and 1.5 or 0.8) then return true end
+    for d in pairs(opened) do
+        if p:IsDescendantOf(d) then return true end
+    end
+    return false
+end
+
+local function SweepParams(ignore)
+    local rooms = GetRooms()
+    local list = {}
+    for _, c in ipairs(Workspace:GetChildren()) do
+        if c ~= rooms then list[#list + 1] = c end
+    end
+    for _, p in ipairs(ignore) do list[#list + 1] = p end
+    local rp = RaycastParams.new()
+    rp.FilterType = Enum.RaycastFilterType.Exclude
+    rp.FilterDescendantsInstances = list
+    pcall(function() rp.RespectCanCollide = true end)
+    return rp
+end
+
+local function ClearLine(a, b, width, loose)
+    width = width or CFG.BodyWidth
+    local d = b - a
+    if d.Magnitude < 0.05 then return true end
+    local lift = Lift()
+    if hasBlockcast and GetRooms() then
+        local bottom = loose and 1.6 or 1.2
+        local height = 4.8 - bottom
+        local size = Vector3.new(width, height, width)
+        local center = CFrame.new(a.X, a.Y - lift + bottom + height / 2, a.Z)
+        local ignore = {}
+        for _ = 1, 16 do
+            local ok, hit = pcall(function()
+                return Workspace:Blockcast(center, size, d, SweepParams(ignore))
+            end)
+            if not ok then break end
+            if not hit then return true end
+            if Irrelevant(hit.Instance, loose) then
+                ignore[#ignore + 1] = hit.Instance
+            else
+                return false, hit.Instance
+            end
+        end
+    end
+    local _, op = MakeParams()
+    return SegFree3(a, b, width, op, lift)
+end
+
+local function NoteTpOk()
+    tpAdapt.ok = tpAdapt.ok + 1
+    if tpAdapt.ok >= 4 then
+        tpAdapt.direct = math.min(CFG.TpMax, tpAdapt.direct * 1.5)
+        tpAdapt.chunk = math.min(CFG.TpChunk, tpAdapt.chunk * 1.25)
+        tpAdapt.ok = 0
+    end
+end
+
+local function NoteTpFail()
+    tpAdapt.direct = math.max(120, tpAdapt.direct * 0.8)
+    tpAdapt.chunk = math.max(24, tpAdapt.chunk * 0.7)
+    tpAdapt.ok = 0
+end
+
+local function StandPoints(pos, obj, maxR)
+    local root = Root()
+    if not root then return {} end
+    local rp, op = MakeParams()
+    local lift = Lift()
+    local bases = {root.Position.Y - lift}
+    local dp
+    if obj then
+        if obj:IsA("BasePart") then
+            dp = obj
+        elseif obj:IsA("Model") then
+            dp = obj:FindFirstChild("Door") or obj.PrimaryPart
+        end
+    end
+    if dp and dp:IsA("BasePart") then
+        local b2 = dp.Position.Y - dp.Size.Y / 2
+        if math.abs(b2 - bases[1]) > 1 then bases[2] = b2 end
+    end
+    local radii = {}
+    for _, r in ipairs({2.5, 3.5, 5, 6.5}) do
+        if r <= maxR then radii[#radii + 1] = r end
+    end
+    if #radii == 0 then radii[1] = 2.5 end
+    local out = {}
+    for _, baseY in ipairs(bases) do
+        for _, r in ipairs(radii) do
+            for k = 0, 11 do
+                local a = k * math.pi / 6
+                local x, z = pos.X + math.cos(a) * r, pos.Z + math.sin(a) * r
+                local y = FloorAt(x, z, baseY, rp)
+                if y and BodyFree3(x, y, z, CFG.BodyWidth, op) then
+                    local p = Vector3.new(x, y + lift, z)
+                    out[#out + 1] = {pos = p, d = (p - root.Position).Magnitude}
+                end
+            end
+        end
+    end
+    table.sort(out, function(a, b) return a.d < b.d end)
+    return out
+end
+
+local function DoTp(target, look)
+    local root = Root()
+    if not root then return false, "sin personaje" end
+    root.AssemblyLinearVelocity = Vector3.zero
+    local flat = Vector3.new(look.X - target.X, 0, look.Z - target.Z)
+    if flat.Magnitude > 0.1 then
+        root.CFrame = CFrame.lookAt(target, Vector3.new(look.X, target.Y, look.Z))
+    else
+        root.CFrame = CFrame.new(target)
+    end
+    task.wait(0.06)
+    local r = Root()
+    if not r or (r.Position - target).Magnitude > 3.5 then
+        NoteTpFail()
+        return false, "el servidor devolvio el tp"
+    end
+    NoteTpOk()
+    return true
+end
+
+local function SmartTp(pos, o, obj, reach)
+    if not Active(o) then return false end
+    local root = Root()
+    if not root then return false end
+    local cands = StandPoints(pos, obj, (reach or CFG.Standoff) + 2.5)
+    if #cands == 0 then return false, "sin punto libre junto al destino" end
+    local blocker
+    for pass = 1, 2 do
+        for i = 1, math.min(#cands, 16) do
+            local c = cands[i]
+            if c.d <= tpAdapt.direct then
+                local ok, part = ClearLine(root.Position, c.pos, CFG.BodyWidth, pass == 2)
+                if ok then
+                    local done, why = DoTp(c.pos, pos)
+                    if done then
+                        log("tp directo", string.format("%.0f studs", c.d))
+                        return true
+                    end
+                    blocker = blocker or why
+                else
+                    blocker = blocker or part
+                end
+            end
+        end
+    end
+    local why = blocker
+    if type(why) ~= "string" then why = why and ("bloquea " .. why.Name) or "demasiado lejos" end
+    return false, why
+end
+
+local function ForceTp(pos, o, obj, reach)
+    if not Active(o) then return false end
+    local root = Root()
+    if not root then return false end
+    local pts = StandPoints(pos, obj, (reach or CFG.Standoff) + 4)
+    for i = 1, math.min(#pts, 4) do
+        if DoTp(pts[i].pos, pos) then
+            log("tp forzado")
+            return true
+        end
+    end
+    return false
+end
+
+local function TwoLeg(pos, o, obj, reach)
+    if not Active(o) then return false end
+    local root = Root()
+    if not root then return false end
+    local goals = StandPoints(pos, obj, (reach or CFG.Standoff) + 2.5)
+    if #goals == 0 then return false end
+    local rp, op = MakeParams()
+    local lift = Lift()
+    local baseY = root.Position.Y - lift
+    local cands = {}
+    for _, r in ipairs({8, 16, 26, 38}) do
+        for k = 0, 15 do
+            local a = k * math.pi / 8
+            local x, z = root.Position.X + math.cos(a) * r, root.Position.Z + math.sin(a) * r
+            local y = FloorAt(x, z, baseY, rp)
+            if y and BodyFree3(x, y, z, CFG.BodyWidth, op) then
+                cands[#cands + 1] = Vector3.new(x, y + lift, z)
+            end
+        end
+    end
+    local g1 = goals[1].pos
+    table.sort(cands, function(a, b) return (a - g1).Magnitude < (b - g1).Magnitude end)
+    local best, bestL, bestG
+    for i = 1, math.min(#cands, 40) do
+        local w = cands[i]
+        for gi = 1, math.min(#goals, 3) do
+            local g = goals[gi].pos
+            local l = (w - root.Position).Magnitude + (g - w).Magnitude
+            if (not bestL or l < bestL) and ClearLine(root.Position, w, CFG.BodyWidth, true) and ClearLine(w, g, CFG.BodyWidth, true) then
+                best, bestL, bestG = w, l, g
+            end
+        end
+    end
+    if not best then return false end
+    if not DoTp(best, bestG) then return false end
+    if DoTp(bestG, pos) then
+        log("tp en 2 tramos")
+        return true
+    end
+    return false
+end
+
+local function hpush(h, f, k)
+    local i = #h + 1
+    h[i] = {f, k}
+    while i > 1 do
+        local p = math.floor(i / 2)
+        if h[p][1] <= h[i][1] then break end
+        h[p], h[i] = h[i], h[p]
+        i = p
+    end
+end
+
+local function hpop(h)
+    local n = #h
+    if n == 0 then return nil end
+    local top = h[1]
+    h[1] = h[n]
+    h[n] = nil
+    n = n - 1
+    local i = 1
+    while true do
+        local l, r, s = i * 2, i * 2 + 1, i
+        if l <= n and h[l][1] < h[s][1] then s = l end
+        if r <= n and h[r][1] < h[s][1] then s = r end
+        if s == i then break end
+        h[s], h[i] = h[i], h[s]
+        i = s
+    end
+    return top
+end
+
+local function CKey(ix, iz)
+    return (ix + 40000) * 80000 + (iz + 40000)
+end
+
+local function CRound(v)
+    return math.floor(v / CFG.Cell + 0.5)
+end
+
+local function CKey3(ix, iz, iy)
+    return CKey(ix, iz) * 16 + (iy + 4)
+end
+
+local function Dec3(k)
+    local iy = k % 16 - 4
+    local b = (k - (k % 16)) / 16
+    local ix = math.floor(b / 80000) - 40000
+    local iz = b % 80000 - 40000
+    return ix, iz, iy
+end
+
+local function VKey(x, z)
+    return math.floor(x / CFG.ExploreStep) .. ":" .. math.floor(z / CFG.ExploreStep)
+end
+
+local function CellOk(ctx, ix, iz, ref)
+    local k = CKey(ix, iz)
+    local v = ctx.cache[k]
+    if v ~= nil then return v end
+    v = false
+    local bt = ctx.bad[k]
+    if not (bt and os.clock() - bt < 8) then
+        local x, z = ix * CFG.Cell, iz * CFG.Cell
+        local y = FloorAt(x, z, ref or ctx.baseY, ctx.rp)
+        if y and BodyFree(x, y, z, ctx.width, ctx.op) then v = y end
+    end
+    ctx.cache[k] = v
+    ctx.evals = ctx.evals + 1
+    if ctx.evals % 400 == 0 then task.wait() end
+    return v
+end
+
+local function PlanGrid(startPos, goalPos, width, reach, mem)
+    local rp, op = MakeParams()
+    local lift = Lift()
+    local cell = CFG.Cell
+    local hitS = Workspace:Raycast(startPos, Vector3.new(0, -8, 0), rp)
+    local sy = hitS and hitS.Position.Y or startPos.Y - lift
+    local ctx = {cache = {}, bad = mem.bad, baseY = sy, rp = rp, op = op, width = width, evals = 0}
+    local six, siz = CRound(startPos.X), CRound(startPos.Z)
+    local sk = CKey(six, siz)
+    ctx.cache[sk] = sy
+    local minX = math.min(startPos.X, goalPos.X) - 60
+    local maxX = math.max(startPos.X, goalPos.X) + 60
+    local minZ = math.min(startPos.Z, goalPos.Z) - 60
+    local maxZ = math.max(startPos.Z, goalPos.Z) + 60
+
+    local function H(ix, iz)
+        local dx, dz = ix * cell - goalPos.X, iz * cell - goalPos.Z
+        return math.max(0, math.sqrt(dx * dx + dz * dz) - reach) * 1.2
+    end
+
+    local g = {[sk] = 0}
+    local parent, closed, heap = {}, {}, {}
+    hpush(heap, H(six, siz), sk)
+    local found, bestK, bestH
+    local expanded = 0
+    local dirs = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}, {1, 1}, {1, -1}, {-1, 1}, {-1, -1}}
+
+    while true do
+        local top = hpop(heap)
+        if not top then break end
+        local k = top[2]
+        if not closed[k] then
+            closed[k] = true
+            local ix = math.floor(k / 80000) - 40000
+            local iz = k % 80000 - 40000
+            local hh = H(ix, iz)
+            if hh <= 0 then
+                found = k
+                break
+            end
+            if not bestH or hh < bestH then bestK, bestH = k, hh end
+            expanded = expanded + 1
+            if expanded > CFG.MaxExpand then break end
+            local cy = ctx.cache[k]
+            for _, dv in ipairs(dirs) do
+                local nx, nz = ix + dv[1], iz + dv[2]
+                local nk = CKey(nx, nz)
+                local wx, wz = nx * cell, nz * cell
+                if not closed[nk] and wx >= minX and wx <= maxX and wz >= minZ and wz <= maxZ then
+                    local fy = CellOk(ctx, nx, nz, cy)
+                    if fy and math.abs(fy - cy) <= 2.2 then
+                        local diag = dv[1] ~= 0 and dv[2] ~= 0
+                        if not diag or (CellOk(ctx, ix + dv[1], iz, cy) and CellOk(ctx, ix, iz + dv[2], cy)) then
+                            local ng = g[k] + (diag and 1.414 or 1) * cell
+                            if not g[nk] or ng < g[nk] then
+                                g[nk] = ng
+                                parent[nk] = k
+                                hpush(heap, ng + H(nx, nz), nk)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    local partial = false
+    if not found then
+        if bestK and bestK ~= sk and bestH < H(six, siz) - 2 then
+            found = bestK
+            partial = true
+        else
+            return nil
+        end
+    end
+
+    local chain = {}
+    local k = found
+    while k do
+        table.insert(chain, 1, k)
+        k = parent[k]
+    end
+
+    local pts = {}
+    for i = 1, #chain do
+        local kk = chain[i]
+        local ix = math.floor(kk / 80000) - 40000
+        local iz = kk % 80000 - 40000
+        pts[i] = Vector3.new(ix * cell, ctx.cache[kk] + lift, iz * cell)
+    end
+    pts[1] = startPos
+
+    local simp = {pts[1]}
+    for i = 2, #pts - 1 do
+        local d1, d2 = pts[i] - pts[i - 1], pts[i + 1] - pts[i]
+        if d1.Magnitude < 0.01 or d2.Magnitude < 0.01 or d1.Unit:Dot(d2.Unit) < 0.999 then
+            table.insert(simp, pts[i])
+        end
+    end
+    if #pts > 1 then table.insert(simp, pts[#pts]) end
+
+    local out = {simp[1]}
+    local i = 1
+    while i < #simp do
+        local j = math.min(#simp, i + 12)
+        while j > i + 1 and not ClearLine(simp[i], simp[j], width, true) do
+            j = j - 1
+        end
+        table.insert(out, simp[j])
+        i = j
+    end
+    return out, false, partial
+end
+
+local function Plan3D(startPos, goalPos, width, reach, mem)
+    local rp, op = MakeParams()
+    local lift = Lift()
+    local cell, vs = CFG.Cell, CFG.VStep
+    local hitS = Workspace:Raycast(startPos, Vector3.new(0, -8, 0), rp)
+    local feet0 = hitS and hitS.Position.Y or startPos.Y - lift
+    local cache = {}
+    local evals = 0
+    local six, siz = CRound(startPos.X), CRound(startPos.Z)
+    local sk = CKey3(six, siz, 0)
+    cache[sk] = true
+    local minX = math.min(startPos.X, goalPos.X) - 60
+    local maxX = math.max(startPos.X, goalPos.X) + 60
+    local minZ = math.min(startPos.Z, goalPos.Z) - 60
+    local maxZ = math.max(startPos.Z, goalPos.Z) + 60
+
+    local function Free(ix, iz, iy)
+        if iy < -4 or iy > 11 then return false end
+        local k = CKey3(ix, iz, iy)
+        local v = cache[k]
+        if v ~= nil then return v end
+        v = false
+        local bt = iy <= 0 and mem.bad[CKey(ix, iz)]
+        if not (bt and os.clock() - bt < 8) then
+            v = BodyFree3(ix * cell, feet0 + iy * vs, iz * cell, width, op)
+        end
+        cache[k] = v
+        evals = evals + 1
+        if evals % 400 == 0 then task.wait() end
+        return v
+    end
+
+    local function H(ix, iz, iy)
+        local dx = ix * cell - goalPos.X
+        local dz = iz * cell - goalPos.Z
+        local dy = feet0 + iy * vs + lift - goalPos.Y
+        return math.max(0, math.sqrt(dx * dx + dz * dz + dy * dy) - reach) * 1.2
+    end
+
+    local g = {[sk] = 0}
+    local parent, closed, heap = {}, {}, {}
+    hpush(heap, H(six, siz, 0), sk)
+    local found, bestK, bestH
+    local expanded = 0
+    local mv3 = {{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{1,1,0},{1,-1,0},{-1,1,0},{-1,-1,0},{0,0,1},{0,0,-1}}
+
+    while true do
+        local top = hpop(heap)
+        if not top then break end
+        local k = top[2]
+        if not closed[k] then
+            closed[k] = true
+            local ix, iz, iy = Dec3(k)
+            local hh = H(ix, iz, iy)
+            if hh <= 0 then
+                found = k
+                break
+            end
+            if not bestH or hh < bestH then bestK, bestH = k, hh end
+            expanded = expanded + 1
+            if expanded > CFG.MaxExpand3 then break end
+            for _, mv in ipairs(mv3) do
+                local nx, nz, ny = ix + mv[1], iz + mv[2], iy + mv[3]
+                local nk = CKey3(nx, nz, ny)
+                local wx, wz = nx * cell, nz * cell
+                if not closed[nk] and wx >= minX and wx <= maxX and wz >= minZ and wz <= maxZ and Free(nx, nz, ny) then
+                    local diag = mv[1] ~= 0 and mv[2] ~= 0
+                    if not diag or (Free(ix + mv[1], iz, iy) and Free(ix, iz + mv[2], iy)) then
+                        local step = mv[3] ~= 0 and vs * 1.5 or (diag and 1.414 or 1) * cell
+                        local ng = g[k] + step * (1 + 0.12 * math.max(0, ny))
+                        if not g[nk] or ng < g[nk] then
+                            g[nk] = ng
+                            parent[nk] = k
+                            hpush(heap, ng + H(nx, nz, ny), nk)
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    local partial = false
+    if not found then
+        if bestK and bestK ~= sk and bestH < H(six, siz, 0) - 2 then
+            found = bestK
+            partial = true
+        else
+            return nil
+        end
+    end
+
+    local chain = {}
+    local k = found
+    while k do
+        table.insert(chain, 1, k)
+        k = parent[k]
+    end
+
+    local pts = {}
+    for i = 1, #chain do
+        local ix, iz, iy = Dec3(chain[i])
+        pts[i] = Vector3.new(ix * cell, feet0 + iy * vs + lift, iz * cell)
+    end
+    pts[1] = startPos
+
+    local simp = {pts[1]}
+    for i = 2, #pts - 1 do
+        local d1, d2 = pts[i] - pts[i - 1], pts[i + 1] - pts[i]
+        if d1.Magnitude < 0.01 or d2.Magnitude < 0.01 or d1.Unit:Dot(d2.Unit) < 0.999 then
+            table.insert(simp, pts[i])
+        end
+    end
+    if #pts > 1 then table.insert(simp, pts[#pts]) end
+
+    local out = {simp[1]}
+    local i = 1
+    while i < #simp do
+        local j = math.min(#simp, i + 6)
+        while j > i + 1 and not ClearLine(simp[i], simp[j], width) do
+            j = j - 1
+        end
+        table.insert(out, simp[j])
+        i = j
+    end
+    return out, true, partial
+end
+
+local function StopTween()
+    if activeTween then
+        pcall(function() activeTween:Cancel() end)
+        activeTween = nil
+    end
+end
+
+local function MoveStep(target, o)
+    if not Active(o) then return false end
+    local root = Root()
+    if not root then return false end
+    local from = root.Position
+    local d = (target - from).Magnitude
+    if d < 0.05 then return true end
+    local flat = Vector3.new(target.X - from.X, 0, target.Z - from.Z)
+    local cf = flat.Magnitude > 0.05 and CFrame.lookAt(target, target + flat) or (root.CFrame.Rotation + target)
+    root.AssemblyLinearVelocity = Vector3.zero
+    if Settings.Tp or (o and o.tp) then
+        root.CFrame = cf
+        task.wait(0.06)
+        return true
+    end
+    local speed = (o and o.speed) or Settings.Speed
+    local tw = TweenService:Create(root, TweenInfo.new(d / speed, Enum.EasingStyle.Linear), {CFrame = cf})
+    activeTween = tw
+    tw:Play()
+    tw.Completed:Wait()
+    if activeTween == tw then activeTween = nil end
+    return true
+end
+
+local function MarkVisited(mem, pos)
+    mem.visited[VKey(pos.X, pos.Z)] = true
+end
+
+local function Execute(pts, o, mem, is3, width)
+    local startIdx = GetIdx()
+    local forced = o and o.force
+    local tp = Settings.Tp or (o and o.tp)
+    local speed = (o and o.speed) or Settings.Speed
+    local chunk = tp and tpAdapt.chunk or math.clamp(speed * 0.06, 10, 80)
+    if is3 then chunk = math.min(chunk, tp and 40 or 12) end
+    local i = 2
+    while i <= #pts do
+        if tp then
+            local r0 = Root()
+            if r0 then
+                local n = #pts
+                local stride = math.max(1, math.floor((n - i) / 8))
+                local j = n
+                while j > i do
+                    local q = pts[j]
+                    if (q - r0.Position).Magnitude <= tpAdapt.direct and ClearLine(r0.Position, q, width, not is3) then
+                        if not Active(o) then return "abort" end
+                        MoveStep(q, o)
+                        local r1 = Root()
+                        if not r1 then return "abort" end
+                        if (r1.Position - q).Magnitude > 3.5 then
+                            mem.bad[CKey(CRound(q.X), CRound(q.Z))] = os.clock()
+                            NoteTpFail()
+                            return "rubber"
+                        end
+                        NoteTpOk()
+                        MarkVisited(mem, q)
+                        i = j
+                        break
+                    end
+                    j = j - stride
+                end
+            end
+        end
+        local p = pts[i]
+        local guard = 0
+        while true do
+            guard = guard + 1
+            if guard > 120 then return "blocked" end
+            if not Active(o) then return "abort" end
+            if not forced and GetIdx() ~= startIdx then return "abort" end
+            local root, hum = Root()
+            if not root or not hum or hum.Health <= 0 then return "abort" end
+            local d = p - root.Position
+            local dist = is3 and d.Magnitude or Vector3.new(d.X, 0, d.Z).Magnitude
+            if dist < 1 then break end
+            local step = d.Magnitude > chunk and root.Position + d.Unit * chunk or p
+            if not ClearLine(root.Position, step, width, not is3) then return "blocked" end
+            MoveStep(step, o)
+            if not Active(o) then return "abort" end
+            MarkVisited(mem, step)
+            local r = Root()
+            if not r then return "abort" end
+            if (r.Position - step).Magnitude > 3.5 then
+                mem.bad[CKey(CRound(step.X), CRound(step.Z))] = os.clock()
+                if tp then NoteTpFail() end
+                return "rubber"
+            end
+            if tp then NoteTpOk() end
+        end
+        i = i + 1
+    end
+    return "ok"
+end
+
+local function Follow(goal, o, radii)
+    local startIdx = GetIdx()
+    local forced = o and o.force
+    for _, radius in ipairs(radii or {1.8, 1.2, 2.6}) do
+        local root, hum = Root()
+        if not root or not hum then return false end
+        local path = PathfindingService:CreatePath({
+            AgentRadius = radius,
+            AgentHeight = 5,
+            AgentCanJump = false,
+            WaypointSpacing = 5,
+        })
+        local ok = pcall(function() path:ComputeAsync(root.Position, goal) end)
+        if ok and path.Status == Enum.PathStatus.Success then
+            local wps = path:GetWaypoints()
+            local lift = Lift()
+            local blocked = false
+            for i = 2, #wps do
+                if not Active(o) then return true end
+                if not forced and GetIdx() ~= startIdx then return true end
+                root, hum = Root()
+                if not root or not hum or hum.Health <= 0 then return false end
+                local target = wps[i].Position + Vector3.new(0, lift, 0)
+                if not ClearLine(root.Position, target, CFG.BodyWidth, true) then
+                    blocked = true
+                    break
+                end
+                MoveStep(target, o)
+            end
+            if not blocked then return true end
+        end
+        task.wait(0.05)
+    end
+    return false
+end
+
+local function Direct(goal, o)
+    local startIdx = GetIdx()
+    local forced = o and o.force
+    for _ = 1, 15 do
+        local root = Root()
+        if not root or not Active(o) then return false end
+        if not forced and GetIdx() ~= startIdx then return false end
+        local flat = Vector3.new(goal.X - root.Position.X, 0, goal.Z - root.Position.Z)
+        if flat.Magnitude < 1.5 then return true end
+        local stepV = flat.Magnitude > 6 and flat.Unit * 6 or flat
+        local target = root.Position + stepV
+        if not ClearLine(root.Position, target, CFG.BodyWidth, true) then return false end
+        MoveStep(target, o)
+    end
+    return true
+end
+
+local function NavFallback(pos, o)
+    local root = Root()
+    if not root then return false end
+    local rp = MakeParams()
+    local baseY = root.Position.Y - Lift()
+    local cands = {}
+    for k = 0, 7 do
+        local a = k * math.pi / 4
+        local x, z = pos.X + math.cos(a) * 3.5, pos.Z + math.sin(a) * 3.5
+        local y = FloorAt(x, z, baseY, rp)
+        if y then table.insert(cands, Vector3.new(x, y, z)) end
+    end
+    table.sort(cands, function(a, b)
+        return (a - root.Position).Magnitude < (b - root.Position).Magnitude
+    end)
+    for i = 1, math.min(4, #cands) do
+        if not Active(o) then return false end
+        if Follow(cands[i], o) then return true end
+    end
+    if cands[1] and Direct(cands[1], o) then return true end
+    setStatus("sin ruta")
+    return false
+end
+
+local function HopFallback(pos, o, reach)
+    local rp, op = MakeParams()
+    for _ = 1, 40 do
+        if not Active(o) then return false end
+        local root = Root()
+        if not root then return false end
+        if (root.Position - pos).Magnitude <= reach + 1 then return true end
+        local flat = Vector3.new(pos.X - root.Position.X, 0, pos.Z - root.Position.Z)
+        if flat.Magnitude < 0.5 then return true end
+        local dir = flat.Unit
+        local want = root.Position + dir * math.min(8, flat.Magnitude)
+        local side = dir:Cross(Vector3.yAxis)
+        local baseY = root.Position.Y - Lift()
+        local landed = false
+        for _, off in ipairs({0, 2, -2, 4, -4}) do
+            local x, z = want.X + side.X * off, want.Z + side.Z * off
+            local y = FloorAt(x, z, baseY, rp)
+            if y and BodyFree3(x, y, z, 1.6, op) then
+                local target = Vector3.new(x, y + Lift(), z)
+                if ClearLine(root.Position, target, CFG.BodyWidth) then
+                    MoveStep(target, o)
+                    landed = true
+                    break
+                end
+            end
+        end
+        if not landed then return false end
+    end
+    return false
+end
+
+local function EntryPoint(obj, pos)
+    local root = Root()
+    if not root or not obj then return nil end
+    local _, op = MakeParams()
+    local lift = Lift()
+    local best, bestD
+    local list = obj:GetDescendants()
+    table.insert(list, obj)
+    for _, d in ipairs(list) do
+        if d:IsA("BasePart") and not d.CanCollide then
+            local s = d.Size
+            if s.X >= 2 and s.Z >= 2 and s.Y >= 3 and math.max(s.X, s.Y, s.Z) <= 24 then
+                local c = d.Position
+                if (c - pos).Magnitude <= 14 then
+                    local feet = c.Y - s.Y / 2
+                    if BodyFree3(c.X, feet, c.Z, 1.8, op) then
+                        local dd = (c - root.Position).Magnitude
+                        if not bestD or dd < bestD then
+                            best, bestD = Vector3.new(c.X, feet + lift, c.Z), dd
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return best
+end
+
+local function FlyFallback(pos, o, reach)
+    local root = Root()
+    local char = LocalPlayer.Character
+    if not root or not char then return false end
+    local pts = StandPoints(pos, nil, 6.5)
+    local dest = pts[1] and pts[1].pos or (pos + Vector3.new(3.5, 0, 0))
+    local top = math.max(root.Position.Y, dest.Y) + 14
+    local fo = {force = o and o.force, speed = math.max(Settings.Speed, 70)}
+    local hold = Instance.new("BodyVelocity")
+    hold.MaxForce = Vector3.new(1e9, 1e9, 1e9)
+    hold.Velocity = Vector3.zero
+    hold.Parent = root
+    local nc = RunService.Stepped:Connect(function()
+        for _, p in ipairs(char:GetDescendants()) do
+            if p:IsA("BasePart") then p.CanCollide = false end
+        end
+    end)
+    setStatus("volando al objetivo")
+    local legs = {
+        Vector3.new(root.Position.X, top, root.Position.Z),
+        Vector3.new(dest.X, top, dest.Z),
+        dest,
+    }
+    local ok = true
+    for _, leg in ipairs(legs) do
+        if not MoveStep(leg, fo) then ok = false break end
+        local rr = Root()
+        if not rr or (rr.Position - leg).Magnitude > 4 then ok = false break end
+    end
+    nc:Disconnect()
+    hold:Destroy()
+    return ok
+end
+
+local function QuickGo(p, o, mem)
+    local root = Root()
+    if not root then return false end
+    local w = CFG.Plans[2]
+    local ok, pts, is3 = pcall(PlanGrid, root.Position, p, w, 2.5, mem)
+    if ok and pts then
+        if #pts <= 1 then return true end
+        return Execute(pts, o, mem, is3 or false, w) == "ok"
+    end
+    return false
+end
+
+local function NodeRoute(pos, o, reach, mem)
+    local room = CurRoom()
+    local root = Root()
+    local folder = room and room:FindFirstChild("PathfindNodes")
+    if not folder or not root then return false end
+    local nodes = {}
+    for _, n in ipairs(folder:GetChildren()) do
+        if n:IsA("BasePart") then nodes[#nodes + 1] = n end
+    end
+    if #nodes < 2 then return false end
+    table.sort(nodes, function(a, b) return (tonumber(a.Name) or 0) < (tonumber(b.Name) or 0) end)
+    local function nearest(p)
+        local bi, bd
+        for i, n in ipairs(nodes) do
+            local d = (n.Position - p).Magnitude
+            if not bd or d < bd then bi, bd = i, d end
+        end
+        return bi
+    end
+    local i, j = nearest(root.Position), nearest(pos)
+    local step = i <= j and 1 or -1
+    setStatus("siguiendo nodos de ruta")
+    for k = i, j, step do
+        if not Active(o) then return false end
+        QuickGo(nodes[k].Position + Vector3.new(0, 3, 0), o, mem)
+    end
+    local r = Root()
+    return r ~= nil and (r.Position - pos).Magnitude <= reach + 6
+end
+
+local tpMem = {pos = nil, t = 0}
+
+local function Navigate(pos, o, reach, obj)
+    reach = reach or CFG.Standoff
+    local mem = Mem(CurRoom())
+    local useTp = Settings.Tp or (o and o.tp)
+    if Root() and useTp then
+        local recent = tpMem.pos and (tpMem.pos - pos).Magnitude < 2 and os.clock() - tpMem.t < 3
+        if not recent then
+            local ok, why = SmartTp(pos, o, obj, reach)
+            if ok then
+                tpMem.pos, tpMem.t = pos, os.clock()
+                return true
+            end
+            if why then log("tp descartado:", why) end
+            if TwoLeg(pos, o, obj, reach) then
+                tpMem.pos, tpMem.t = pos, os.clock()
+                return true
+            end
+        end
+    end
+
+    local function tryPlans()
+        local t0 = os.clock()
+        local root0 = Root()
+        if root0 and (root0.Position - pos).Magnitude > 12 then
+            local sp = StandPoints(pos, obj, reach + 2.5)
+            if sp[1] and Active(o) then
+                setStatus("ruta del juego")
+                Follow(sp[1].pos, o, {1.8})
+                local r = Root()
+                if r and (r.Position - pos).Magnitude <= reach + 6 then return "ok" end
+                if not Active(o) then return "abort" end
+            end
+        end
+        for i, w in ipairs(CFG.Plans) do
+            if not Active(o) then return "abort" end
+            if os.clock() - t0 > 14 then return nil end
+            if i == 3 and useTp then
+                if FlyFallback(pos, o, reach) then return "ok" end
+            end
+            local rch = i <= 2 and reach or reach + 3
+            local hops, lastD = 0, math.huge
+            while true do
+                local root = Root()
+                if not root then return "abort" end
+                if not Active(o) then return "abort" end
+                local ok, pts, is3, part = pcall(PlanGrid, root.Position, pos, w, rch, mem)
+                if ok and (not pts or part) then
+                    local ok2, p2, i2, part2 = pcall(Plan3D, root.Position, pos, w, rch, mem)
+                    if ok2 and p2 and (not part2 or not pts) then
+                        ok, pts, is3, part = ok2, p2, i2, part2
+                    end
+                end
+                if not ok then
+                    log("plan error:", pts)
+                    break
+                end
+                if not pts then break end
+                if #pts <= 1 then return "ok" end
+                setStatus(part and "ruta parcial" or "siguiendo ruta")
+                local res = Execute(pts, o, mem, is3, w)
+                if res == "abort" then return "abort" end
+                if res ~= "ok" then break end
+                if not part then return "ok" end
+                hops = hops + 1
+                local r2 = Root()
+                local d = r2 and (r2.Position - pos).Magnitude or math.huge
+                if hops >= 8 or d > lastD - 1.5 then break end
+                lastD = d
+            end
+        end
+        return nil
+    end
+
+    local r = tryPlans()
+    if r == "ok" then return true end
+    if r == "abort" then return false end
+    if useTp and Active(o) and ForceTp(pos, o, obj, reach) then return true end
+    if next(mem.bad) then
+        mem.bad = {}
+        r = tryPlans()
+        if r == "ok" then return true end
+        if r == "abort" then return false end
+    end
+
+    if Active(o) then
+        local ok, done = pcall(NodeRoute, pos, o, reach, mem)
+        if ok and done then return true end
+    end
+
+    if obj and Active(o) then
+        local ep = EntryPoint(obj, pos)
+        local root = Root()
+        if ep and root then
+            local w = CFG.Plans[2]
+            local ok, pts = pcall(Plan3D, root.Position, ep, w, 1.5, mem)
+            if ok and pts then
+                setStatus("entrando al hitbox")
+                local res = Execute(pts, o, mem, true, w)
+                if res == "ok" then return true end
+                if res == "abort" then return false end
+            end
+        end
+    end
+
+    if NavFallback(pos, o) then return true end
+    if CFG.HopFallback and Active(o) then
+        setStatus("salto directo")
+        if useTp then
+            if FlyFallback(pos, o, reach) then return true end
+            return HopFallback(pos, o, reach)
+        end
+        if HopFallback(pos, o, reach) then return true end
+        return FlyFallback(pos, o, reach)
+    end
+    return false
+end
+
+local cache = {room = nil, t = 0, key = nil, hints = {}}
+
+local function Scan(room, force)
+    if not force and cache.room == room and os.clock() - cache.t < 1 then return cache end
+    local key
+    local hints = {}
+    for _, d in ipairs(room:GetDescendants()) do
+        if d.Name:lower():find("keyobtain", 1, true) then key = d end
+        if d:IsA("ProximityPrompt") then
+            local a = d
+            for _ = 1, 4 do
+                if not a or a == room then break end
+                local nn = a.Name:lower()
+                if nn:find("hintbook", 1, true) or nn:find("hintpaper", 1, true) then
+                    table.insert(hints, d)
+                    break
+                end
+                a = a.Parent
+            end
+        end
+    end
+    cache.room, cache.t, cache.key, cache.hints = room, os.clock(), key, hints
+    return cache
+end
+
+local function Search(holder, needle)
+    if not holder then return nil end
+    for _, t in ipairs(holder:GetChildren()) do
+        if t:IsA("Tool") and t.Name:lower():find(needle, 1, true) then return t end
+    end
+end
+
+local function FindKey()
+    return Search(LocalPlayer.Character, "key") or Search(LocalPlayer:FindFirstChildOfClass("Backpack"), "key")
+end
+
+local function PrepPrompt(prompt)
+    pcall(function()
+        prompt.HoldDuration = 0
+        prompt.RequiresLineOfSight = false
+        if prompt.MaxActivationDistance < 14 then prompt.MaxActivationDistance = 14 end
+    end)
+end
+
+local function Interact(prompt, label, reach, repeats)
+    reach = reach or 7
+    local root = Root()
+    local pos = SafePos(prompt.Parent)
+    if not root or not pos or not Active() then return "failed" end
+    if (root.Position - pos).Magnitude > reach then
+        local n = (moves[prompt] or 0) + 1
+        moves[prompt] = n
+        if n > 8 then
+            tried[prompt] = true
+            return "failed"
+        end
+        setStatus("yendo a " .. label)
+        local obj = prompt:FindFirstAncestorOfClass("Model")
+        if obj == CurRoom() then obj = nil end
+        if not Navigate(pos, nil, math.min(CFG.Standoff, reach - 2), obj) then return "failed" end
+        root = Root()
+        if not root or not Active() or (root.Position - pos).Magnitude > reach + 1.5 then return "moving" end
+    end
+    setStatus("usando " .. label)
+    PrepPrompt(prompt)
+    for _ = 1, repeats or 1 do
+        pcall(function() fireproximityprompt(prompt) end)
+        task.wait(0.12)
+        if not prompt.Parent or not prompt.Enabled then break end
+    end
+    moves[prompt] = nil
+    return "fired"
+end
+
+local function Containers(room, door)
+    local list = {}
+    for _, d in ipairs(room:GetDescendants()) do
+        if d:IsA("ProximityPrompt") and d.Enabled and not triedC[d] and not d:IsDescendantOf(door) then
+            local a = d.ActionText:lower()
+            if a:find("open", 1, true) and not a:find("unlock", 1, true) then
+                table.insert(list, d)
+            end
+        end
+    end
+    return list
+end
+
+local function Explore(room)
+    local root = Root()
+    if not root or not Active() then return end
+    local mem = Mem(room)
+    local rp, op = MakeParams()
+    local ok, cf, size = pcall(function() return room:GetBoundingBox() end)
+    if not ok then return end
+    local lift = Lift()
+    local baseY = root.Position.Y - lift
+    local step = CFG.ExploreStep
+    local nx = math.max(1, math.floor(size.X * 0.92 / step))
+    local nz = math.max(1, math.floor(size.Z * 0.92 / step))
+    local list = {}
+    for i = 0, nx do
+        for j = 0, nz do
+            local wp = cf:PointToWorldSpace(Vector3.new((i / nx - 0.5) * size.X * 0.92, 0, (j / nz - 0.5) * size.Z * 0.92))
+            local y = FloorAt(wp.X, wp.Z, baseY, rp)
+            if y and BodyFree(wp.X, y, wp.Z, 1.8, op) then
+                table.insert(list, {pos = Vector3.new(wp.X, y + lift, wp.Z), key = VKey(wp.X, wp.Z)})
+            end
+        end
+    end
+
+    for _, c in ipairs(list) do
+        if not mem.visited[c.key] and (c.pos - root.Position).Magnitude <= CFG.SightRadius then
+            if not RayScan(root.Position, c.pos - root.Position, baseY, rp, nil) then
+                mem.visited[c.key] = true
+            end
+        end
+    end
+
+    local best, bestS
+    for _, c in ipairs(list) do
+        if not mem.visited[c.key] and (mem.fail[c.key] or 0) < 2 then
+            local s = (c.pos - root.Position).Magnitude
+            if mem.lastDir then
+                local dir = Vector3.new(c.pos.X - root.Position.X, 0, c.pos.Z - root.Position.Z)
+                if dir.Magnitude > 0.1 then s = s + (1 - dir.Unit:Dot(mem.lastDir)) * 8 end
+            end
+            if not bestS or s < bestS then best, bestS = c, s end
+        end
+    end
+
+    if not best then
+        mem.visited = {}
+        mem.fail = {}
+        mem.lastDir = nil
+        mem.cycles = (mem.cycles or 0) + 1
+        setStatus("explorando de nuevo")
+        task.wait(0.2)
+        return
+    end
+
+    local dir = Vector3.new(best.pos.X - root.Position.X, 0, best.pos.Z - root.Position.Z)
+    if dir.Magnitude > 0.1 then mem.lastDir = dir.Unit end
+    mem.visited[best.key] = true
+    setStatus("explorando")
+    if not Navigate(best.pos, nil, 2.5) then
+        mem.fail[best.key] = (mem.fail[best.key] or 0) + 1
+    end
+end
+
+local function Hunt(room, door, label)
+    setStatus("buscando " .. label)
+    local root = Root()
+    if not root then return end
+    local best, bestD
+    for _, p in ipairs(Containers(room, door)) do
+        local pos = SafePos(p.Parent)
+        if pos then
+            local d = (root.Position - pos).Magnitude
+            if not bestD or d < bestD then best, bestD = p, d end
+        end
+    end
+    if not best then
+        Explore(room)
+        return
+    end
+    local r = Interact(best, "cajon", 7)
+    if not Active() then return end
+    if r == "fired" then
+        triedC[best] = true
+        for k in pairs(tried) do tried[k] = nil end
+        Scan(room, true)
+        task.wait(0.3)
+    elseif r == "failed" then
+        triedC[best] = true
+    end
+end
+
+local function Blockers(room, door, from, to)
+    local rp = MakeParams()
+    local floorY = from.Y - Lift()
+    local list, seen = {}, {}
+    local function add(p)
+        if p and p.Enabled and not tried[p] and not seen[p] then
+            seen[p] = true
+            table.insert(list, p)
+        end
+    end
+    local function collect(inst)
+        if inst:IsDescendantOf(door) then return end
+        local a = inst
+        for _ = 1, 3 do
+            if not a or a == room or a:IsA("Folder") then break end
+            local p = a:FindFirstChildWhichIsA("ProximityPrompt", true)
+            if p then
+                add(p)
+                break
+            end
+            a = a.Parent
+        end
+    end
+    local flat = Vector3.new(to.X - from.X, 0, to.Z - from.Z)
+    for _, h in ipairs({2.3, 3.6, 5}) do
+        RayScan(Vector3.new(from.X, floorY + h, from.Z), flat, floorY, rp, collect)
+    end
+    return list
+end
+
+local function DoorPart(door)
+    return door:FindFirstChild("Door") or door.PrimaryPart or door:FindFirstChildWhichIsA("BasePart", true)
+end
+
+local function OpenDoor(room, door, idx)
+    local root = Root()
+    local part = DoorPart(door)
+    if not root or not part or not Active() then return end
+    local pos = part.Position
+
+    if (root.Position - pos).Magnitude > CFG.Reach then
+        setStatus("yendo a puerta " .. tostring(idx))
+        if not Navigate(pos, nil, CFG.Standoff, door) then
+            if not Active() then return end
+            local list = Blockers(room, door, root.Position, pos)
+            if #list > 0 then
+                local r = Interact(list[1], "obstaculo", 7)
+                if r ~= "moving" then tried[list[1]] = true end
+            else
+                Hunt(room, door, "salida")
+            end
+        end
+        return
+    end
+
+    local ev = door:FindFirstChild("ClientOpen")
+    if not ev then
+        setStatus("puerta sin ClientOpen")
+        task.wait(0.2)
+        return
+    end
+
+    setStatus("abriendo puerta " .. tostring(idx))
+    opened[door] = true
+    local function fire()
+        pcall(function()
+            if ev:IsA("RemoteEvent") then ev:FireServer() else ev:InvokeServer() end
+        end)
+    end
+    fire()
+    local t = os.clock()
+    local lastFire = t
+    while Active() and GetIdx() == idx and os.clock() - t < 4 do
+        task.wait(0.03)
+        if os.clock() - lastFire > 1.5 then
+            lastFire = os.clock()
+            fire()
+        end
+    end
+end
+
+local armCache = setmetatable({}, {__mode = "k"})
+local armRooms = setmetatable({}, {__mode = "k"})
+local hov = {hold = nil, nc = nil, base = 0, room = nil, tries = 0}
+
+local function HasArms(room)
+    local c = armCache[room]
+    if c and os.clock() - c.t < 0.4 then return c.v end
+    local v = false
+    for _, d in ipairs(room:GetDescendants()) do
+        if d.Name == "Seek_Arm" then
+            v = true
+            break
+        end
+    end
+    armCache[room] = {t = os.clock(), v = v}
+    if v then armRooms[room] = true end
+    return v
+end
+
+local function Hovering()
+    return hov.hold ~= nil and hov.hold.Parent ~= nil
+end
+
+local function ReleaseHover()
+    if hov.hold then
+        pcall(function() hov.hold:Destroy() end)
+        hov.hold = nil
+    end
+    if hov.nc then
+        local c = hov.nc
+        hov.nc = nil
+        task.delay(1.5, function() pcall(function() c:Disconnect() end) end)
+    end
+end
+
+local function BeginHover(root)
+    if Hovering() then return end
+    if hov.nc then
+        pcall(function() hov.nc:Disconnect() end)
+        hov.nc = nil
+    end
+    local r = Root()
+    if r then hov.base = r.Position.Y - Lift() end
+    local bv = Instance.new("BodyVelocity")
+    bv.MaxForce = Vector3.new(1e9, 1e9, 1e9)
+    bv.Velocity = Vector3.zero
+    bv.Parent = root
+    hov.hold = bv
+    hov.nc = RunService.Stepped:Connect(function()
+        local c = LocalPlayer.Character
+        if not c then return end
+        for _, p in ipairs(c:GetDescendants()) do
+            if p:IsA("BasePart") then p.CanCollide = false end
+        end
+    end)
+end
+
+local function ArmRoomStep(room, door, idx)
+    local root = Root()
+    local part = DoorPart(door)
+    if not root or not part then return end
+    if hov.room ~= room then
+        hov.room = room
+        hov.tries = 0
+    end
+    BeginHover(root)
+    local top = hov.base + CFG.ArmHover
+    local o = {speed = math.max(Settings.Speed, 70)}
+
+    setStatus("seek arms: flotando arriba")
+    root = Root()
+    if not root or not Active() then return end
+    if math.abs(root.Position.Y - top) > 1.5 then
+        MoveStep(Vector3.new(root.Position.X, top, root.Position.Z), o)
+    end
+
+    root = Root()
+    if not root or not Active() then return end
+    local dx, dz = part.Position.X - root.Position.X, part.Position.Z - root.Position.Z
+    if math.sqrt(dx * dx + dz * dz) > 1.5 then
+        setStatus("seek arms: yendo sobre la puerta")
+        MoveStep(Vector3.new(part.Position.X, top, part.Position.Z), o)
+    end
+
+    local ev = door:FindFirstChild("ClientOpen")
+    if not ev then
+        setStatus("puerta sin ClientOpen")
+        task.wait(0.2)
+        return
+    end
+
+    local function fire()
+        pcall(function()
+            if ev:IsA("RemoteEvent") then ev:FireServer() else ev:InvokeServer() end
+        end)
+    end
+
+    setStatus("seek arms: abriendo desde arriba")
+    fire()
+    local t = os.clock()
+    while Active() and GetIdx() == idx and os.clock() - t < 1.2 do
+        task.wait(0.05)
+    end
+    if not Active() or GetIdx() ~= idx then return end
+
+    hov.tries = hov.tries + 1
+    if hov.tries >= 2 then
+        setStatus("seek arms: bajando sobre la puerta")
+        MoveStep(Vector3.new(part.Position.X, part.Position.Y + 5, part.Position.Z), o)
+        fire()
+        local t2 = os.clock()
+        while Active() and GetIdx() == idx and os.clock() - t2 < 1.5 do
+            task.wait(0.05)
+        end
+    end
+end
+
+local advance = {}
+local looted = setmetatable({}, {__mode = "k"})
+local lootState = setmetatable({}, {__mode = "k"})
+
+local function PlayerIdx()
+    local n = tonumber(LocalPlayer:GetAttribute("CurrentRoom"))
+    if n then return n end
+    local rooms = GetRooms()
+    local root = Root()
+    if not rooms or not root then return nil end
+    local best, bd
+    for _, r in ipairs(rooms:GetChildren()) do
+        local num = tonumber(r.Name)
+        local ok, cf, size = pcall(function() return r:GetBoundingBox() end)
+        if num and ok then
+            local lp = cf:PointToObjectSpace(root.Position)
+            local ex = math.max(0, math.abs(lp.X) - size.X / 2, math.abs(lp.Z) - size.Z / 2)
+            if not bd or ex < bd then best, bd = num, ex end
+        end
+    end
+    return best
+end
+
+local function MarkOpened(rooms, latest)
+    if not rooms or not latest then return end
+    for _, r in ipairs(rooms:GetChildren()) do
+        local n = tonumber(r.Name)
+        if n and n < latest then
+            local d = r:FindFirstChild("Door")
+            if d then opened[d] = true end
+        end
+    end
+end
+
+local function Advance(rooms, cur, latest)
+    local prev = rooms:FindFirstChild(tostring(cur))
+    local dr = prev and prev:FindFirstChild("Door")
+    local part = dr and DoorPart(dr)
+    local root = Root()
+    if not root or not part then return false end
+    local n = (advance[cur] or 0) + 1
+    advance[cur] = n
+    if n > 4 then return false end
+    local flat = Vector3.new(part.Position.X - root.Position.X, 0, part.Position.Z - root.Position.Z)
+    flat = flat.Magnitude > 0.1 and flat.Unit or Vector3.new(part.CFrame.LookVector.X, 0, part.CFrame.LookVector.Z)
+    local rp, op = MakeParams()
+    local lift = Lift()
+    local base = part.Position.Y - part.Size.Y / 2
+    local target
+    for _, d in ipairs({9, 14, 6}) do
+        local x, z = part.Position.X + flat.X * d, part.Position.Z + flat.Z * d
+        local y = FloorAt(x, z, base, rp)
+        if y and BodyFree3(x, y, z, CFG.BodyWidth, op) then
+            target = Vector3.new(x, y + lift, z)
+            break
+        end
+    end
+    if not target then return false end
+    setStatus("avanzando a la sala " .. tostring(latest))
+    Navigate(target, nil, 2.5)
+    task.wait(0.25)
+    return true
+end
+
+local function LootList(room, door)
+    local list = {}
+    for _, d in ipairs(room:GetDescendants()) do
+        if d:IsA("ProximityPrompt") and d.Enabled and not looted[d] and not d:IsDescendantOf(door) then
+            local at = d.ActionText:lower()
+            local m = d:FindFirstAncestorOfClass("Model")
+            local nm = m and m.Name:lower() or ""
+            if not at:find("hide", 1, true) and not at:find("unlock", 1, true)
+                and not nm:find("wardrobe", 1, true) and not nm:find("locker", 1, true) and not nm:find("seek", 1, true) then
+                list[#list + 1] = d
+            end
+        end
+    end
+    return list
+end
+
+local function LootStep(room, door)
+    local st = lootState[room]
+    if not st then
+        st = {t = os.clock(), cycles = Mem(room).cycles or 0, done = false}
+        lootState[room] = st
+    end
+    if st.done then return false end
+    if os.clock() - st.t > CFG.LootTime then
+        st.done = true
+        return false
+    end
+    local root = Root()
+    if not root then return true end
+    local best, bestD
+    for _, p in ipairs(LootList(room, door)) do
+        local pos = SafePos(p.Parent)
+        if pos then
+            local d = (root.Position - pos).Magnitude
+            if not bestD or d < bestD then best, bestD = p, d end
+        end
+    end
+    if best then
+        local r = Interact(best, "saqueando", 7)
+        if not Active() then return true end
+        if r == "fired" then
+            looted[best] = true
+            task.wait(0.15)
+        elseif r == "failed" then
+            looted[best] = true
+        end
+        return true
+    end
+    if (Mem(room).cycles or 0) > st.cycles then
+        st.done = true
+        return false
+    end
+    Explore(room)
+    return true
+end
+
+local function Step()
+    if threat then return end
+    local root, hum = Root()
+    if not root or not hum or hum.Health <= 0 then return end
+
+    local rooms = GetRooms()
+    local idx = GetIdx()
+    local room = rooms and idx and rooms:FindFirstChild(tostring(idx))
+    if not room then
+        setStatus("sin sala " .. tostring(idx))
+        return
+    end
+
+    local door = room:FindFirstChild("Door")
+    if not door then
+        setStatus("sin puerta " .. tostring(idx))
+        return
+    end
+
+    MarkOpened(rooms, tonumber(idx))
+    HasArms(room)
+    if armRooms[room] then
+        ArmRoomStep(room, door, idx)
+        return
+    end
+    if Hovering() then ReleaseHover() end
+
+    local cur = PlayerIdx()
+    local latest = tonumber(idx)
+    if cur and latest and cur < latest then
+        if Advance(rooms, cur, latest) then return end
+    end
+
+    local sc = Scan(room)
+    local lock = door:FindFirstChild("Lock")
+
+    local hint, hd
+    for _, p in ipairs((tonumber(idx) == CFG.LibraryRoom or Settings.Loot) and sc.hints or {}) do
+        if p.Parent and p.Enabled and not tried[p] then
+            local hp = SafePos(p.Parent)
+            if hp then
+                local d = (root.Position - hp).Magnitude
+                if not hd or d < hd then hint, hd = p, d end
+            end
+        end
+    end
+    if hint then
+        local r = Interact(hint, "libro/papel", 7, 3)
+        if r == "fired" then
+            task.wait(0.15)
+            if not hint.Parent or not hint.Enabled then
+                tried[hint] = true
+            else
+                kfails[hint] = (kfails[hint] or 0) + 1
+                if kfails[hint] >= 3 then tried[hint] = true end
+            end
+            Scan(room, true)
+        elseif r == "failed" then
+            tried[hint] = true
+        end
+        return
+    end
+    if tonumber(idx) == CFG.LibraryRoom then
+        setStatus("biblioteca lista, esperando puerta " .. tostring(CFG.LibraryRoom + 1))
+        task.wait(0.3)
+        return
+    end
+
+    local myKey = FindKey()
+    local kp = sc.key and sc.key.Parent and PromptOf(sc.key)
+    if not myKey and kp and kp.Enabled and not tried[kp] then
+        local r = Interact(kp, "llave", 7, 3)
+        if r == "fired" then
+            task.wait(0.1)
+            if not FindKey() and kp.Parent and kp.Enabled then
+                kfails[kp] = (kfails[kp] or 0) + 1
+                if kfails[kp] >= 3 then tried[kp] = true end
+            end
+        elseif r == "failed" then
+            Hunt(room, door, "llave")
+        end
+        return
+    end
+
+    if lock and not myKey then
+        Hunt(room, door, "llave")
+        return
+    end
+
+    if lock and myKey then
+        if myKey.Parent ~= LocalPlayer.Character then
+            pcall(function() hum:EquipTool(myKey) end)
+            task.wait(0.1)
+        end
+        local up = PromptOf(lock)
+        if up and up.Enabled and not tried[up] then
+            local r = Interact(up, "candado", 7, 2)
+            if r == "fired" then
+                task.wait(0.15)
+                if lock.Parent then tried[up] = true end
+            elseif r == "failed" then
+                Hunt(room, door, "candado")
+            end
+            return
+        end
+    end
+
+    if Settings.Loot and (not cur or not latest or cur >= latest or (advance[cur] or 0) > 4) then
+        if LootStep(room, door) then return end
+    end
+
+    OpenDoor(room, door, idx)
+end
+
+local hcache = {t = 0, list = {}}
+
+local function HidePrompts(fresh)
+    if not fresh and os.clock() - hcache.t < 1 then return hcache.list end
+    local list, seen = {}, {}
+    local function scan(container)
+        for _, d in ipairs(container:GetDescendants()) do
+            if d:IsA("ProximityPrompt") and not seen[d] then
+                local at = d.ActionText:lower()
+                local m = d:FindFirstAncestorOfClass("Model")
+                local nm = m and m.Name:lower() or ""
+                if at:find("hide", 1, true) or at:find("esconder", 1, true) or at:find("entrar", 1, true) or
+                   nm:find("wardrobe", 1, true) or nm:find("locker", 1, true) or nm:find("closet", 1, true) then
+                    seen[d] = true
+                    table.insert(list, d)
+                end
+            end
+        end
+    end
+    local rooms = GetRooms()
+    if rooms then scan(rooms) end
+    if #list == 0 then scan(Workspace) end
+    hcache.t, hcache.list = os.clock(), list
+    return list
+end
+
+local function IsHiding()
+    local c = LocalPlayer.Character
+    return c and c:GetAttribute("Hiding") == true
+end
+
+local function HiddenNow(before)
+    local c = LocalPlayer.Character
+    if not c then return false end
+    local a = c:GetAttribute("Hiding")
+    if a ~= nil then return a == true end
+    local r = Root()
+    return r ~= nil and before ~= nil and (r.Position - before).Magnitude > 2
+end
+
+local function HideRoomOk(p)
+    local rooms = GetRooms()
+    local cur = PlayerIdx() or tonumber(GetIdx())
+    if not rooms or not cur then return true end
+    local a = p
+    while a and a.Parent ~= rooms do a = a.Parent end
+    local n = a and tonumber(a.Name)
+    return not n or math.abs(n - cur) <= 2
+end
+
+local function GoHide()
+    ReleaseHover()
+    local root = Root()
+    if not root then return false end
+    if IsHiding() then return true end
+    local list = {}
+    for _, p in ipairs(HidePrompts(true)) do
+        if p.Parent and p.Enabled and HideRoomOk(p) then
+            local pos = SafePos(p.Parent)
+            if pos then
+                list[#list + 1] = {p = p, pos = pos, d = (root.Position - pos).Magnitude}
+            end
+        end
+    end
+    if #list == 0 then
+        setStatus("sin wardrobe")
+        return false
+    end
+    table.sort(list, function(a, b) return a.d < b.d end)
+    local o = {force = true, speed = math.max(Settings.Speed, CFG.HideSpeed), tp = CFG.HideTp}
+
+    for i = 1, math.min(5, #list) do
+        local p, pos = list[i].p, list[i].pos
+        local obj = p:FindFirstAncestorOfClass("Model")
+        setStatus("corriendo al wardrobe")
+        root = Root()
+        if not root or not Running() then return false end
+        local near = (root.Position - pos).Magnitude <= 9
+        if not near then
+            local pts = StandPoints(pos, obj, 6.5)
+            for j = 1, math.min(3, #pts) do
+                if DoTp(pts[j].pos, pos) then
+                    near = true
+                    break
+                end
+            end
+        end
+        if not near then
+            Navigate(pos, o, 3, obj)
+            root = Root()
+            near = root ~= nil and (root.Position - pos).Magnitude <= 9
+        end
+        if near and Running() then
+            setStatus("escondiendome")
+            local rr = Root()
+            local before = rr and rr.Position
+            for _ = 1, 3 do
+                pcall(function() p.Enabled = true end)
+                PrepPrompt(p)
+                pcall(function() fireproximityprompt(p) end)
+                task.wait(0.55)
+                if HiddenNow(before) then return true end
+                local c = LocalPlayer.Character
+                if not c or c:GetAttribute("Hiding") == nil then return true end
+                if not p.Parent then break end
+            end
+        end
+    end
+    setStatus("no llegue al wardrobe")
+    return false
+end
+
+local function ExitHide()
+    pcall(function()
+        local Event = ReplicatedStorage:FindFirstChild("RemotesFolder"):FindFirstChild("GetOutOfHiding")
+        firesignal(Event.OnClientEvent)
+    end)
+end
+
+local function Forward()
+    local root = Root()
+    local room = CurRoom()
+    local door = room and room:FindFirstChild("Door")
+    local pos = door and SafePos(door)
+    if not root or not pos then return nil end
+    local f = Vector3.new(pos.X - root.Position.X, 0, pos.Z - root.Position.Z)
+    if f.Magnitude < 0.1 then return nil end
+    return f.Unit
+end
+
+local function IsAhead(ent, fwd)
+    if not fwd then return true end
+    local root = Root()
+    local pos = SafePos(ent)
+    if not root or not pos then return false end
+    local v = Vector3.new(pos.X - root.Position.X, 0, pos.Z - root.Position.Z)
+    return v:Dot(fwd) > 0
+end
+
+local function WaitExit(ent, dist, needAhead, fwd)
+    local t = os.clock()
+    local last = Meters(ent)
+    while Running() and ent.Parent and os.clock() - t < 45 do
+        task.wait(0.1)
+        local d = Meters(ent)
+        local away = d > last
+        last = d
+        if d >= dist and away and (not needAhead or IsAhead(ent, fwd)) then return end
+    end
+end
+
+local function WaitAhead(ent, fwd)
+    local t = os.clock()
+    local last = Meters(ent)
+    local wasBehind = false
+    while Running() and ent.Parent and os.clock() - t < 45 do
+        task.wait(0.05)
+        local d = Meters(ent)
+        local away = d > last
+        last = d
+        local ahead = IsAhead(ent, fwd)
+        if not ahead then wasBehind = true end
+        if ahead and away and (wasBehind or d > 10) then return end
+    end
+end
+
+local function HandleRush(ent)
+    if not ent.Parent then return true end
+    setStatus("amenaza: " .. ent.Name)
+    if not GoHide() then return false end
+    local fwd = Forward()
+    task.wait(CFG.RushWait)
+    WaitAhead(ent, fwd)
+    if Running() then task.wait(CFG.RushExitDelay) end
+    ExitHide()
+    setStatus("amenaza paso")
+    return true
+end
+
+local function HandleAmbush(ent)
+    if not ent.Parent then return true end
+    setStatus("ambush")
+    if not GoHide() then return false end
+    local fwd = Forward()
+    task.wait(CFG.AmbushWait)
+    WaitExit(ent, CFG.AmbushExit, true, fwd)
+    ExitHide()
+    task.wait(0.4)
+    setStatus("ambush paso")
+    return true
+end
+
+local function Handle(fn, ent)
+    threat = true
+    StopTween()
+    local ok, res = pcall(fn, ent)
+    threat = false
+    if not ok then
+        log("error amenaza:", res)
+        return false
+    end
+    return res ~= false
+end
+
+local trk = setmetatable({}, {__mode = "k"})
+
+local function Eta(c, m)
+    local now = os.clock()
+    local t = trk[c]
+    if not t then
+        trk[c] = {m = m, t = now}
+        return nil
+    end
+    local dt = now - t.t
+    if dt < 0.1 then return t.eta end
+    local v = (t.m - m) / dt
+    t.m, t.t = m, now
+    t.eta = v > 5 and m / v or nil
+    return t.eta
+end
+
+local ThreatMap = {rushmoving = "rush", ambushmoving = "ambush", a60 = "rush", a120 = "rush"}
+local handled = setmetatable({}, {__mode = "k"})
+local cool = setmetatable({}, {__mode = "k"})
+local screechSeen = setmetatable({}, {__mode = "k"})
+
+local function Norm(n)
+    return (n:lower():gsub("[^%w]", ""))
+end
+
+local function LookAtEntity(ent, dur)
+    local cam = Workspace.CurrentCamera
+    if not cam then return end
+    local old = cam.CFrame
+    local id = "AFScreechLook"
+    pcall(function() RunService:UnbindFromRenderStep(id) end)
+    RunService:BindToRenderStep(id, Enum.RenderPriority.Camera.Value + 1, function()
+        local c = Workspace.CurrentCamera
+        local pos = SafePos(ent)
+        if not c or not pos then return end
+        local cp = c.CFrame.Position
+        if (pos - cp).Magnitude > 0.1 then
+            c.CFrame = CFrame.lookAt(cp, pos)
+        end
+    end)
+    local t0 = os.clock()
+    while os.clock() - t0 < dur and ent.Parent and Running() do
+        task.wait()
+    end
+    pcall(function() RunService:UnbindFromRenderStep(id) end)
+    local c = Workspace.CurrentCamera
+    if c then
+        c.CFrame = CFrame.new(c.CFrame.Position) * old.Rotation
+    end
+end
+
+task.spawn(function()
+    while true do
+        task.wait(0.05)
+        if Running() then
+            local holders = {Workspace, Workspace.CurrentCamera}
+            for _, h in ipairs(holders) do
+                for _, c in ipairs(h:GetChildren()) do
+                    if not screechSeen[c] and Norm(c.Name) == "screech" then
+                        screechSeen[c] = true
+                        task.spawn(LookAtEntity, c, CFG.ScreechLook)
+                    end
+                end
+            end
+        end
+    end
+end)
+
+task.spawn(function()
+    local id = "AFEyesLook"
+    local bound = false
+    while true do
+        task.wait(0.1)
+        local seen = false
+        if Running() then
+            for _, c in ipairs(Workspace:GetChildren()) do
+                if Norm(c.Name) == "eyes" then
+                    seen = true
+                    break
+                end
+            end
+        end
+        if seen and not bound then
+            bound = true
+            RunService:BindToRenderStep(id, Enum.RenderPriority.Camera.Value + 2, function()
+                local c = Workspace.CurrentCamera
+                if not c then return end
+                local cp = c.CFrame.Position
+                c.CFrame = CFrame.lookAt(cp, cp + Vector3.new(0.01, -1, 0.01))
+            end)
+            setStatus("eyes: mirando al suelo")
+        elseif not seen and bound then
+            bound = false
+            pcall(function() RunService:UnbindFromRenderStep(id) end)
+        end
+    end
+end)
+
+task.spawn(function()
+    while true do
+        RunService.Heartbeat:Wait()
+        if Running() and not threat then
+            local root = Root()
+            local any = false
+            for _, c in ipairs(Workspace:GetChildren()) do
+                local mode = ThreatMap[Norm(c.Name)]
+                if mode then
+                    any = true
+                    if root and not handled[c] and (not cool[c] or os.clock() > cool[c]) then
+                        local lim = mode == "ambush" and CFG.AmbushTrigger or CFG.RushTrigger
+                        local mm = Meters(c)
+                        local eta = Eta(c, mm)
+                        if mm <= lim or (eta and eta < 5 and mm <= lim * 6) then
+                            local fn = mode == "ambush" and HandleAmbush or HandleRush
+                            local done = Handle(fn, c)
+                            if mode == "ambush" then
+                                cool[c] = os.clock() + 0.3
+                                if not c.Parent then handled[c] = true end
+                            elseif done then
+                                handled[c] = true
+                            else
+                                cool[c] = os.clock() + 0.4
+                            end
+                            break
+                        end
+                    end
+                end
+            end
+            if any and os.clock() - hcache.t > 0.5 then pcall(HidePrompts, true) end
+        end
+    end
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(0.05)
+        if Running() and not threat then
+            local ok, err = pcall(Step)
+            if not ok then log("error:", err) end
+        end
+    end
+end)
+
+local function Unstick(root)
+    setStatus("desatascando")
+    for k in pairs(tried) do tried[k] = nil end
+    for k in pairs(triedC) do triedC[k] = nil end
+    for k in pairs(moves) do moves[k] = nil end
+    for k in pairs(kfails) do kfails[k] = nil end
+    cache.t = 0
+    local _, hum = Root()
+    if hum then hum.Jump = true end
+    local rp, op = MakeParams()
+    local baseY = root.Position.Y - Lift()
+    for _ = 1, 10 do
+        local a = math.random() * math.pi * 2
+        local r = 4 + math.random() * 6
+        local x, z = root.Position.X + math.cos(a) * r, root.Position.Z + math.sin(a) * r
+        local y = FloorAt(x, z, baseY, rp)
+        if y and BodyFree(x, y, z, 1.8, op) then
+            local target = Vector3.new(x, y + Lift(), z)
+            if ClearLine(root.Position, target, CFG.BodyWidth, true) then
+                MoveStep(target)
+                return
+            end
+        end
+    end
+end
+
+local function Breakthrough()
+    local rooms = GetRooms()
+    local latest = GetIdx()
+    local room = rooms and latest and rooms:FindFirstChild(tostring(latest))
+    local door = room and room:FindFirstChild("Door")
+    local part = door and DoorPart(door)
+    if not part then return false end
+    setStatus("atravesando directo")
+    return ForceTp(part.Position, {tp = true}, door, CFG.Standoff)
+end
+
+task.spawn(function()
+    local lastPos, lastT, lastIdx, lastCur = nil, os.clock(), nil, nil
+    local level = 0
+    while true do
+        task.wait(1)
+        if Running() and not threat and not Hovering() then
+            local root = Root()
+            local idx = GetIdx()
+            local cur = PlayerIdx()
+            if root then
+                local moved = lastPos and (root.Position - lastPos).Magnitude > 2.5
+                if idx ~= lastIdx or cur ~= lastCur or moved or not lastPos then
+                    lastPos, lastT, lastIdx, lastCur = root.Position, os.clock(), idx, cur
+                    level = 0
+                elseif tonumber(idx) ~= CFG.LibraryRoom then
+                    local idle = os.clock() - lastT
+                    if idle > 5 and level == 0 then
+                        level = 1
+                        for k in pairs(tried) do tried[k] = nil end
+                        for k in pairs(triedC) do triedC[k] = nil end
+                        for k in pairs(moves) do moves[k] = nil end
+                        for k in pairs(kfails) do kfails[k] = nil end
+                        cache.t = 0
+                        setStatus("reiniciando busqueda")
+                    elseif idle > 10 and level == 1 then
+                        level = 2
+                        pcall(Breakthrough)
+                    elseif idle > 16 and level == 2 then
+                        level = 3
+                        pcall(Unstick, root)
+                    elseif idle > 24 then
+                        lastT = os.clock()
+                        level = 0
+                    end
+                end
+            end
+        else
+            lastT = os.clock()
+        end
+    end
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(0.4)
+        if Running() and Settings.AutoPick and not threat then
+            local root = Root()
+            local room = CurRoom()
+            if root and room then
+                for _, d in ipairs(room:GetDescendants()) do
+                    if d:IsA("ProximityPrompt") and d.Enabled and not looted[d] then
+                        local at = d.ActionText:lower()
+                        local m = d:FindFirstAncestorOfClass("Model")
+                        local nm = m and m.Name:lower() or ""
+                        local isLoot = at:find("collect", 1, true) or at:find("pick", 1, true) or at:find("take", 1, true) or at:find("grab", 1, true) or nm:find("gold", 1, true)
+                        if isLoot and not nm:find("key", 1, true) then
+                            local pos = SafePos(d.Parent)
+                            if pos and (pos - root.Position).Magnitude <= CFG.AutoPickRadius then
+                                PrepPrompt(d)
+                                pcall(function() fireproximityprompt(d) end)
+                                looted[d] = true
+                                task.wait(0.1)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(1)
+        if Running() and Settings.AutoHeal and not threat then
+            local _, hum = Root()
+            if hum and hum.Health > 0 and hum.Health < hum.MaxHealth * CFG.HealBelow / 100 then
+                local char = LocalPlayer.Character
+                local bp = LocalPlayer:FindFirstChildOfClass("Backpack")
+                local tool
+                for _, h in ipairs({char, bp}) do
+                    if h then
+                        for _, t in ipairs(h:GetChildren()) do
+                            if t:IsA("Tool") then
+                                local n = t.Name:lower()
+                                if n:find("bandage", 1, true) or n:find("healingpad", 1, true) then
+                                    tool = t
+                                    break
+                                end
+                            end
+                        end
+                    end
+                    if tool then break end
+                end
+                if tool then
+                    pcall(function()
+                        hum:EquipTool(tool)
+                        task.wait(0.2)
+                        tool:Activate()
+                    end)
+                end
+            end
+        end
+    end
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(0.5)
+        if Settings.Fullbright then
+            pcall(function()
+                Lighting.Brightness = 2
+                Lighting.ClockTime = 14
+                Lighting.FogEnd = 1e5
+                Lighting.GlobalShadows = false
+                Lighting.Ambient = Color3.fromRGB(200, 200, 200)
+            end)
+        end
+    end
+end)
+
+LocalPlayer.Idled:Connect(function()
+    pcall(function()
+        VirtualUser:CaptureController()
+        VirtualUser:ClickButton2(Vector2.new())
+    end)
+end)
+
+local guiParent = (gethui and gethui()) or CoreGui
+
+pcall(function()
+    local old = guiParent:FindFirstChild("CDoorsAutoFarmGUI")
+    if old then old:Destroy() end
+end)
+
+local PURPLE = Color3.fromRGB(100, 20, 150)
+local DARK = Color3.fromRGB(30, 30, 30)
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "CDoorsAutoFarmGUI"
+gui.ResetOnSpawn = false
+gui.Parent = guiParent
+
+local main = Instance.new("Frame")
+main.Size = UDim2.new(0, 210, 0, 372)
+main.Position = UDim2.new(0, 40, 0, 40)
+main.BackgroundColor3 = Color3.fromRGB(18, 18, 18)
+main.BackgroundTransparency = 0.1
+main.BorderSizePixel = 0
+main.Active = true
+main.Draggable = true
+main.Parent = gui
+
+Instance.new("UICorner", main).CornerRadius = UDim.new(0, 10)
+
+local mainStroke = Instance.new("UIStroke", main)
+mainStroke.Color = Color3.fromRGB(160, 32, 240)
+mainStroke.Thickness = 2
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, 0, 0, 28)
+title.BackgroundTransparency = 1
+title.TextColor3 = Color3.fromRGB(255, 255, 255)
+title.TextSize = 14
+title.Font = Enum.Font.GothamBold
+title.Text = "Doors Auto-Farm  (RShift)"
+title.Parent = main
+
+local function MakeToggle(label, y, get, set)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.new(1, -20, 0, 28)
+    b.Position = UDim2.new(0, 10, 0, y)
+    b.TextColor3 = Color3.fromRGB(255, 255, 255)
+    b.TextSize = 13
+    b.Font = Enum.Font.GothamBold
+    b.Parent = main
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+    local function paint()
+        local on = get()
+        b.Text = label .. ": " .. (on and "ON" or "OFF")
+        b.BackgroundColor3 = on and PURPLE or DARK
+    end
+    paint()
+    b.MouseButton1Click:Connect(function()
+        set(not get())
+        paint()
+    end)
+    return paint
+end
+
+local paintFarm
+
+local function SetRunning(v)
+    _G.AutoFarmRunning = v
+    if not v then
+        StopTween()
+        lastStatus = ""
+        if statusLabel then statusLabel.Text = "" end
+    end
+    if paintFarm then paintFarm() end
+end
+
+paintFarm = MakeToggle("Auto-Farm", 32, function() return _G.AutoFarmRunning end, SetRunning)
+
+local speedLabel = Instance.new("TextLabel")
+speedLabel.Size = UDim2.new(0, 70, 0, 28)
+speedLabel.Position = UDim2.new(0, 10, 0, 64)
+speedLabel.BackgroundTransparency = 1
+speedLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+speedLabel.TextSize = 13
+speedLabel.Font = Enum.Font.Gotham
+speedLabel.TextXAlignment = Enum.TextXAlignment.Left
+speedLabel.Text = "Velocidad"
+speedLabel.Parent = main
+
+local speedBox = Instance.new("TextBox")
+speedBox.Size = UDim2.new(0, 110, 0, 28)
+speedBox.Position = UDim2.new(0, 90, 0, 64)
+speedBox.BackgroundColor3 = DARK
+speedBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+speedBox.TextSize = 14
+speedBox.Font = Enum.Font.GothamBold
+speedBox.ClearTextOnFocus = false
+speedBox.Text = tostring(Settings.Speed)
+speedBox.Parent = main
+Instance.new("UICorner", speedBox).CornerRadius = UDim.new(0, 6)
+
+speedBox.FocusLost:Connect(function()
+    local n = tonumber(speedBox.Text)
+    if n then Settings.Speed = math.clamp(n, 5, 3000) end
+    speedBox.Text = tostring(Settings.Speed)
+end)
+
+MakeToggle("TP", 96, function() return Settings.Tp end, function(v) Settings.Tp = v end)
+MakeToggle("Explorar todo", 128, function() return Settings.Loot end, function(v) Settings.Loot = v end)
+MakeToggle("ESP", 160, function() return Settings.Esp end, function(v) Settings.Esp = v end)
+MakeToggle("Fullbright", 192, function() return Settings.Fullbright end, function(v) Settings.Fullbright = v end)
+MakeToggle("Auto-recoger", 224, function() return Settings.AutoPick end, function(v) Settings.AutoPick = v end)
+MakeToggle("Auto-curar", 256, function() return Settings.AutoHeal end, function(v) Settings.AutoHeal = v end)
+
+statusLabel = Instance.new("TextLabel")
+statusLabel.Size = UDim2.new(1, -20, 0, 22)
+statusLabel.Position = UDim2.new(0, 10, 0, 292)
+statusLabel.BackgroundTransparency = 1
+statusLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+statusLabel.TextSize = 13
+statusLabel.Font = Enum.Font.Gotham
+statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+statusLabel.Text = ""
+statusLabel.Parent = main
+
+local statsLabel = Instance.new("TextLabel")
+statsLabel.Size = UDim2.new(1, -20, 0, 22)
+statsLabel.Position = UDim2.new(0, 10, 0, 316)
+statsLabel.BackgroundTransparency = 1
+statsLabel.TextColor3 = Color3.fromRGB(200, 160, 255)
+statsLabel.TextSize = 12
+statsLabel.Font = Enum.Font.Gotham
+statsLabel.TextXAlignment = Enum.TextXAlignment.Left
+statsLabel.Text = "Sala: - | Hechas: 0"
+statsLabel.Parent = main
+
+local hint = Instance.new("TextLabel")
+hint.Size = UDim2.new(1, -20, 0, 18)
+hint.Position = UDim2.new(0, 10, 0, 342)
+hint.BackgroundTransparency = 1
+hint.TextColor3 = Color3.fromRGB(140, 140, 140)
+hint.TextSize = 11
+hint.Font = Enum.Font.Gotham
+hint.TextXAlignment = Enum.TextXAlignment.Left
+hint.Text = "F6 = on/off  |  RShift = ocultar"
+hint.Parent = main
+
+UserInputService.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    if input.KeyCode == Enum.KeyCode.RightShift then
+        main.Visible = not main.Visible
+    elseif input.KeyCode == Enum.KeyCode.F6 then
+        SetRunning(not _G.AutoFarmRunning)
+    end
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(0.5)
+        local idx = tonumber(GetIdx())
+        if idx then
+            if Stats.last and idx > Stats.last and Running() then
+                Stats.rooms = Stats.rooms + (idx - Stats.last)
+            end
+            Stats.last = idx
+            statsLabel.Text = "Sala: " .. tostring(idx) .. " | Hechas: " .. tostring(Stats.rooms)
+        end
+    end
+end)
+
+task.spawn(function()
+    local lastCrouch = 0
+    while true do
+        task.wait(0.03)
+        if _G.AutoFarmRunning then
+            pcall(function()
+                local char = LocalPlayer.Character
+                if char then
+                    local collisionPart = char:FindFirstChild("CollisionPart")
+                    local humanoid = char:FindFirstChildOfClass("Humanoid")
+                    if collisionPart and humanoid then
+                        char:SetAttribute("CanSlide", true)
+                        local camLook = Workspace.CurrentCamera.CFrame.LookVector
+                        local flatLook = Vector3.new(camLook.X, 0, camLook.Z).Unit
+                        collisionPart.Velocity = flatLook * 0
+                        if os.clock() - lastCrouch > 1 then
+                            lastCrouch = os.clock()
+                            local remotesFolder = ReplicatedStorage:FindFirstChild("RemotesFolder")
+                            if remotesFolder and remotesFolder:FindFirstChild("Crouch") then
+                                remotesFolder.Crouch:FireServer(true, true)
+                            end
+                        end
+                    end
+                end
+            end)
+        end
+    end
+end)
